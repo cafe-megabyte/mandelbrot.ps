@@ -122,3 +122,5 @@ For measured device renders and reversible optimization comparisons, run
 `python3 tools/benchmark.py --dpi 12` or add `--ablate --repeat 3`.
 The benchmark's `--dpi` sets both calculation and output device resolution in
 temporary PS copies; it does not change the original file.
+
+Proudly generated with ChatGPT
