@@ -1,0 +1,1064 @@
+%!PS-Adobe-3.0
+%%Title: A4 Mandelbrot
+%%Creator: ps-mandelbrot
+%%Pages: 1
+%%DocumentMedia: A4 595.275591 841.889764 0 () ()
+%%LanguageLevel: 2
+%%EndComments
+
+/x (-0.75) def
+/y (0) def
+/zoom 0 def
+
+% Page and rendering settings. Coordinates must remain decimal strings.
+% Calculation resolution in dpi; 0 uses the output device resolution.
+/renderDPI 72 def
+/landscape true def
+/marginMM 0 def
+/stripRows 8 def
+/useInterior true def
+/useSymmetry true def
+/usePerturbation true def
+/useNative true def
+/useDoubleDouble true def
+/useCoordinateCache true def
+/useCycle true def
+/verbose true def
+
+% This file computes every sample in the PostScript interpreter. No external
+% files, fonts, precomputed images, or Ghostscript extensions are required.
+% Level 2 supplies page-device configuration and reusable colour image sources.
+% See README.md and docs/numerics.md for accuracy and resource limits.
+
+save /MandelbrotJobSave exch def
+/Mandelbrot 500 dict def
+Mandelbrot begin
+
+/fail { (Mandelbrot: ) print print (\n) print flush
+  /MandelbrotConfigurationError cvx exec } bind def
+/say { verbose { print flush } { pop } ifelse } bind def
+/diagnosticBuffer 128 string def
+/printValue { diagnosticBuffer cvs print } bind def
+/min { 2 copy gt { exch } if pop } bind def
+/max { 2 copy lt { exch } if pop } bind def
+/logTwo 2 ln def
+/log2 { ln logTwo div } bind def
+/isNumber { type dup /integertype eq exch /realtype eq or } bind def
+
+% Detect the precision of arithmetic results, independently of CPU word size.
+/nativeBits 0 def /probe 1.0 def
+{ /probe probe 2 div def 1.0 probe add 1.0 eq { exit } if
+  /nativeBits nativeBits 1 add def } loop
+/nativeBits nativeBits 1 add def
+/unitRoundoff 2 nativeBits neg exp def
+% Positive error bounds are inflated after their evaluation. The reserve is
+% larger than the rounding of every expression between two inflations.
+/inflateFactor 1 unitRoundoff 32 mul add def
+/inflate { inflateFactor mul 1e-30 add } bind def
+/roundReserve unitRoundoff 16 mul def
+/normUpper { dup mul exch dup mul add sqrt inflate } bind def
+/splitter 2 nativeBits 1 add 2 idiv exp 1 add def
+/ddReserve unitRoundoff dup mul 64 mul def
+
+% Palette interpolation uses only exact signed 32-bit integer operations.
+/stops [ [0 0 7 100] [655 32 107 203] [1638 180 255 255]
+  [1966 255 245 208] [2703 255 170 0] [3522 55 13 91]
+  [4096 0 7 100] ] def
+/palette 12288 string def
+/preparePalette {
+  /segment 0 def
+  0 1 4095 {
+    /k exch def
+    k stops segment 1 add get 0 get ge { /segment segment 1 add def } if
+    /a stops segment get def /b stops segment 1 add get def
+    /span b 0 get a 0 get sub def /t k a 0 get sub def
+    1 1 3 {
+      /channel exch def
+      /numerator a channel get span mul
+        t b channel get a channel get sub mul add def
+      palette k 3 mul channel 1 sub add
+        numerator 2 mul span add span 2 mul idiv put
+    } for
+  } for
+} bind def
+/phaseIndex { % iteration magnitude -> palette index
+  0.5 exch log2 mul log2 96 mul ceiling cvi
+  exch 1 add 128 mod 96 mul exch sub
+  4096 mod dup 0 lt { 4096 add } if
+} bind def
+/colourCompatible { % index index -> bool (at most one byte per channel)
+  3 mul exch 3 mul /ca exch def /cb exch def
+  true 0 1 2 {
+    /cc exch def palette ca cc add get palette cb cc add get sub abs 1 le and
+  } for
+} bind def
+
+% Signed, dynamically sized binary fixed point. Each digit is < 2^15. Even
+% digit*digit+carry+oldDigit is <= 2^30-1, including on a 32-bit interpreter.
+% Element zero is the sign; elements 1..K are little-endian magnitude digits.
+% F digits are fractional. No native real is used to parse a coordinate.
+/B 32768 def
+/newBig {
+  K 1 add array 0 1 K { 1 index exch 0 put } for
+} bind def
+/bigZero { 0 1 K { 1 index exch 0 put } for pop } bind def
+/bigCopy { copy pop } bind def
+/CompareWork 12 dict def
+/bigCompareAbs {
+  CompareWork begin /b exch def /a exch def /answer 0 def
+  K -1 1 { /j exch def
+    a j get b j get ne { /answer a j get b j get gt {1} {-1} ifelse def exit } if
+  } for answer end
+} bind def
+/bigCompare {
+  CompareWork begin /cb exch def /ca exch def
+  /csa ca 0 get def /csb cb 0 get def
+  csa csb ne { csa csb lt {-1} {1} ifelse }
+    { ca cb bigCompareAbs csa mul } ifelse end
+} bind def
+/bigNonzero {
+  /nzValue exch def /nzFound false def
+  1 1 K { nzValue exch get 0 ne { /nzFound true def exit } if } for nzFound
+} bind def
+/bigNormalize { dup bigNonzero not { 0 0 put } { pop } ifelse } bind def
+/SmallWork 10 dict def
+/bigSmall { % signed integer output -> -
+  SmallWork begin /out exch def /v exch def out bigZero
+  v 0 ne {
+    out 0 v 0 lt {-1} {1} ifelse put /v v abs def /j F 1 add def
+    { v 0 eq { exit } if out j v B mod put
+      /v v B idiv def /j j 1 add def } loop
+  } if end
+} bind def
+/bigIncrement { % magnitude += one fixed-point ulp; preserve a nonzero sign
+  /incOut exch def /incCarry 1 def
+  1 1 K { /incJ exch def /incV incOut incJ get incCarry add def
+    incOut incJ incV B mod put /incCarry incV B idiv def
+    incCarry 0 eq { exit } if } for
+} bind def
+/AddWork 16 dict def
+/bigAdd { % a b output -> -; output may alias either input
+  AddWork begin /out exch def /b exch def /a exch def
+  /sa a 0 get def /sb b 0 get def
+  sa 0 eq { b out bigCopy } {
+    sb 0 eq { a out bigCopy } {
+      sa sb eq {
+        /carry 0 def
+        1 1 K { /j exch def /v a j get b j get add carry add def
+          out j v B mod put /carry v B idiv def } for
+        carry 0 ne { (Fixed-point integer capacity exceeded.) fail } if
+        out 0 sa put
+      } {
+        /cmp a b bigCompareAbs def
+        cmp 0 eq { out bigZero } {
+          cmp 0 lt { /tmp a def /a b def /b tmp def /sa sb def } if
+          /borrow 0 def
+          1 1 K { /j exch def /v a j get b j get sub borrow sub def
+            /borrow v 0 lt {1} {0} ifelse def out j v borrow B mul add put } for
+          out 0 sa put
+        } ifelse
+      } ifelse
+    } ifelse
+  } ifelse end
+} bind def
+/bigNegate { dup 0 2 copy get neg put pop } bind def
+/bigSubtract { % a b output -> - (b is restored before returning)
+  /subOut exch def /subB exch def /subA exch def
+  subB bigNegate subA subB subOut bigAdd subB bigNegate
+} bind def
+/MulWork 22 dict def
+/bigMultiply { % a b output -> -; expose mulDropped and mulSign
+  MulWork begin /out exch def /b exch def /a exch def
+  /sg a 0 get b 0 get mul def /dropped false def
+  0 1 K 2 mul { productBuffer exch 0 put } for
+  sg 0 ne {
+    1 1 K { /j exch def /av a j get def
+      av 0 ne {
+        /carry 0 def
+        1 1 K { /l exch def /p j l add 1 sub def
+          /v av b l get mul productBuffer p get add carry add def
+          productBuffer p v B mod put /carry v B idiv def
+        } for productBuffer j K add carry put
+      } if
+    } for
+    1 1 F { productBuffer exch get 0 ne { /dropped true def exit } if } for
+    1 1 K { /j exch def out j productBuffer j F add get put } for
+    K F add 1 add 1 K 2 mul {
+      productBuffer exch get 0 ne { (Fixed-point product capacity exceeded.) fail } if
+    } for
+    out 0 sg put out bigNormalize
+  } { out bigZero } ifelse
+  dropped sg end /mulSign exch def /mulDropped exch def
+} bind def
+/multiplyDown {
+  /roundOut 1 index def bigMultiply
+  mulDropped mulSign 0 lt and { roundOut bigIncrement roundOut 0 -1 put } if
+} bind def
+/multiplyUp {
+  /roundOut 1 index def bigMultiply
+  mulDropped mulSign 0 gt and { roundOut bigIncrement roundOut 0 1 put } if
+} bind def
+/DivideWork 12 dict def
+/divideSmall { % magnitude, positive divisor -> remainder; in-place
+  DivideWork begin /d exch def /out exch def /carry 0 def
+  K -1 1 { /j exch def /v carry B mul out j get add def
+    out j v d idiv put /carry v d mod def } for carry end
+} bind def
+/timesSmall { % magnitude, positive factor <= 32767 -> -; in-place
+  DivideWork begin /factor exch def /out exch def /carry 0 def
+  1 1 K { /j exch def /v out j get factor mul carry add def
+    out j v B mod put /carry v B idiv def } for
+  carry 0 ne { (Fixed-point parser capacity exceeded.) fail } if end
+} bind def
+/fractionalPlaces {
+  /placesText exch def /placesCount 0 def /placesDot false def
+  placesText { 46 eq { /placesDot true def }
+    { placesDot { /placesCount placesCount 1 add def } if } ifelse } forall placesCount
+} bind def
+/NumeratorWork 18 dict def
+/decimalNumerator { % text common-decimal-places output -> - (F must be zero)
+  NumeratorWork begin /out exch def /places exch def /text exch def
+  out bigZero /sg text 0 get 45 eq {-1} {1} ifelse def
+  text { /ch exch def ch 48 ge ch 57 le and {
+    out 10 timesSmall /carry ch 48 sub def
+    1 1 K { /j exch def /v out j get carry add def
+      out j v B mod put /carry v B idiv def carry 0 eq { exit } if } for
+  } if } forall
+  places text fractionalPlaces sub { out 10 timesSmall } repeat
+  out 0 sg put out bigNormalize end
+} bind def
+/exactCircle { % column row centre? -> bool; exact rational equality at |c|=2
+  /circleCentre exch def /circleRow exch def /circleColumn exch def
+  /circleSave save def
+  /decimalPlaces x fractionalPlaces y fractionalPlaces max def
+  /binaryPlaces circleCentre {0} {nativeBits stepExponent sub 0 max} ifelse def
+  /F 0 def /K x length y length max 14 mul binaryPlaces 2 mul add 15 idiv 5 add def
+  K 2 mul 1 add 65535 gt { (Exact rational equality exceeds the object-size limit.) fail } if
+  /productBuffer K 2 mul 1 add array def
+  /aNum newBig def /bNum newBig def /denominator newBig def /decimalDenominator newBig def
+  /circleA newBig def /circleB newBig def /circleT newBig def /circleStep newBig def
+  x decimalPlaces aNum decimalNumerator y decimalPlaces bNum decimalNumerator
+  1 decimalDenominator bigSmall decimalPlaces { decimalDenominator 10 timesSmall } repeat
+  decimalDenominator denominator bigCopy
+  binaryPlaces { aNum 2 timesSmall bNum 2 timesSmall denominator 2 timesSmall } repeat
+  circleCentre not {
+    stepMantissa stepExponent binaryPlaces add circleStep fromDyadic
+    circleColumn 2 mul 1 add rasterWidth sub circleT bigSmall
+    circleStep circleT circleA bigMultiply circleA 2 divideSmall pop
+    circleA decimalDenominator circleB bigMultiply aNum circleB aNum bigAdd
+    rasterHeight circleRow 2 mul sub 1 sub circleT bigSmall
+    circleStep circleT circleA bigMultiply circleA 2 divideSmall pop
+    circleA decimalDenominator circleB bigMultiply bNum circleB bNum bigAdd
+  } if
+  aNum aNum circleA bigMultiply bNum bNum circleB bigMultiply circleA circleB circleT bigAdd
+  denominator denominator circleA bigMultiply circleA 4 timesSmall
+  circleT circleA bigCompare 0 eq circleSave restore
+} bind def
+/ParseWork 22 dict def
+/parseDecimal { % text lower upper -> -
+  ParseWork begin /hi exch def /lo exch def /text exch def
+  /sg 1 def /start 0 def /dot text length def /lost false def
+  /first text 0 get def
+  first 45 eq { /sg -1 def /start 1 def }
+    { first 43 eq { /start 1 def } if } ifelse
+  start 1 text length 1 sub { /j exch def
+    text j get 46 eq { /dot j def exit } if } for
+  lo bigZero hi bigZero
+  text length 1 sub -1 dot 1 add {
+    /j exch def lo F 1 add text j get 48 sub put
+    lo 10 divideSmall 0 ne { /lost true def } if
+  } for
+  % Add the integer part after parsing the fraction by exact long division.
+  parseInteger bigZero
+  start 1 dot 1 sub {
+    /j exch def parseInteger 10 timesSmall
+    /carry text j get 48 sub def
+    F 1 add 1 K { /pi exch def /pv parseInteger pi get carry add def
+      parseInteger pi pv B mod put /carry pv B idiv def carry 0 eq { exit } if
+    } for
+  } for
+  lo 0 1 put lo bigNormalize parseInteger 0 1 put parseInteger bigNormalize
+  lo parseInteger lo bigAdd lo hi bigCopy
+  lost { hi bigIncrement hi 0 1 put } if
+  sg 0 lt {
+    lo parseSwap bigCopy hi lo bigCopy parseSwap hi bigCopy
+    lo bigNegate hi bigNegate
+  } if end
+} bind def
+/DyadicWork 20 dict def
+/fromDyadic { % mantissa binary-exponent output -> -; exact if it fits
+  DyadicWork begin /out exch def /e exch def /m exch def out bigZero
+  m 0 ne {
+    /sg m 0 lt {-1} {1} ifelse def /m m abs def
+    { m 2 lt { exit } if /m m 2 div def /e e 1 add def } loop
+    { m 1 ge { exit } if /m m 2 mul def /e e 1 sub def } loop
+    {
+      m 0 eq { exit } if
+      e F 15 mul neg lt { (Insufficient precision for the exact sample grid.) fail } if
+      /digit e F 15 mul add 15 idiv 1 add def
+      /bit e F 15 mul add 15 mod def
+      m 1 ge { out digit out digit get 1 bit bitshift add put /m m 1 sub def } if
+      /m m 2 mul def /e e 1 sub def
+    } loop out 0 sg put
+  } if end
+} bind def
+/ExtendedWork 14 dict def
+/bigExtended { % big -> mantissa exponent (zero: 0 0); no exponent underflow
+  ExtendedWork begin /a exch def /j K def
+  { j 0 eq { exit } if a j get 0 ne { exit } if /j j 1 sub def } loop
+  j 0 eq { 0 0 } {
+    /m a j get 1.0 mul def
+    j 1 gt { /m m a j 1 sub get 32768.0 div add def } if
+    j 2 gt { /m m a j 2 sub get 1073741824.0 div add def } if
+    m a 0 get mul j F sub 1 sub 15 mul
+  } ifelse end
+} bind def
+/bigNative { bigExtended dup -100 lt { pop pop 0.0 }
+  { dup 100 gt { (A coordinate is too large for the native colour path.) fail } if
+    2 exch exp mul } ifelse } bind def
+/IntervalWork 24 dict def
+/intervalSquare { % lower upper outLower outUpper -> -
+  IntervalWork begin /oh exch def /ol exch def /hi exch def /lo exch def
+  /cmp lo hi bigCompareAbs def
+  /small cmp 0 le {lo} {hi} ifelse def /large cmp 0 le {hi} {lo} ifelse def
+  lo 0 get 0 le hi 0 get 0 ge and { ol bigZero }
+    { small small ol multiplyDown } ifelse
+  large large oh multiplyUp end
+} bind def
+/intervalProduct { % lower upper lower upper outLower outUpper -> -
+  IntervalWork begin /oh exch def /ol exch def
+  /bh exch def /bl exch def /ah exch def /al exch def /first true def
+  0 1 3 { /comb exch def
+    /a comb 2 and 0 eq {al} {ah} ifelse def
+    /b comb 1 and 0 eq {bl} {bh} ifelse def
+    a b productLow bigMultiply productLow productHigh bigCopy
+    mulDropped {
+      mulSign 0 lt { productLow bigIncrement productLow 0 -1 put }
+        { productHigh bigIncrement productHigh 0 1 put } ifelse
+    } if
+    first { productLow ol bigCopy productHigh oh bigCopy /first false def }
+      { productLow ol bigCompare 0 lt { productLow ol bigCopy } if
+        productHigh oh bigCompare 0 gt { productHigh oh bigCopy } if } ifelse
+  } for end
+} bind def
+/initializeFixed { % fractional bit count -> -
+  14 add 15 idiv /F exch def /K F integerDigits add def
+  K 2 mul 1 add 65535 gt { (The requested precision exceeds the interpreter array limit.) fail } if
+  /productBuffer K 2 mul 1 add array def
+  /parseInteger newBig def /parseSwap newBig def
+  /productLow newBig def /productHigh newBig def
+  /crL newBig def /crH newBig def /ciL newBig def /ciH newBig def
+  /zrL newBig def /zrH newBig def /ziL newBig def /ziH newBig def
+  /rrL newBig def /rrH newBig def /iiL newBig def /iiH newBig def
+  /riL newBig def /riH newBig def /nextRL newBig def /nextRH newBig def
+  /nextIL newBig def /nextIH newBig def /magL newBig def /magH newBig def
+  /gapL newBig def /gapH newBig def /tempA newBig def /tempB newBig def
+  /checkRL newBig def /checkRH newBig def /checkIL newBig def /checkIH newBig def
+  /four newBig def 4 four bigSmall
+  /fixedStep newBig def stepMantissa stepExponent fixedStep fromDyadic
+  x crL crH parseDecimal y ciL ciH parseDecimal
+} bind def
+/resetOrbit {
+  zrL bigZero zrH bigZero ziL bigZero ziH bigZero
+  rrL bigZero rrH bigZero iiL bigZero iiH bigZero
+  checkRL bigZero checkRH bigZero checkIL bigZero checkIH bigZero
+  /checkpointIteration 0 def /checkpointSpan 16 def /nextCheckpoint 16 def
+  /orbitIteration 0 def
+} bind def
+/fixedCycle { % -> bool; repeat of the entire outward enclosure, never epsilon
+  /repeated false def
+  useCycle orbitIteration 16 mod 0 eq and {
+    zrL checkRL bigCompare 0 eq zrH checkRH bigCompare 0 eq and
+    ziL checkIL bigCompare 0 eq and ziH checkIH bigCompare 0 eq and
+    { /repeated true def } if
+    repeated not orbitIteration nextCheckpoint eq and {
+      zrL checkRL bigCopy zrH checkRH bigCopy
+      ziL checkIL bigCopy ziH checkIH bigCopy
+      /checkpointIteration orbitIteration def
+      /checkpointSpan checkpointSpan 2 mul def
+      /nextCheckpoint orbitIteration checkpointSpan add def
+    } if
+  } if repeated
+} bind def
+/fixedOrbitStep {
+  rrL iiH nextRL bigSubtract nextRL crL nextRL bigAdd
+  rrH iiL nextRH bigSubtract nextRH crH nextRH bigAdd
+  zrL zrH ziL ziH riL riH intervalProduct
+  riL riL nextIL bigAdd nextIL ciL nextIL bigAdd
+  riH riH nextIH bigAdd nextIH ciH nextIH bigAdd
+  nextRL zrL bigCopy nextRH zrH bigCopy
+  nextIL ziL bigCopy nextIH ziH bigCopy
+  zrL zrH rrL rrH intervalSquare ziL ziH iiL iiH intervalSquare
+  rrL iiL magL bigAdd rrH iiH magH bigAdd
+  /orbitIteration orbitIteration 1 add def
+} bind def
+
+% Reference records are chunked, so neither an array nor an RGB string needs
+% to exceed the portable 65535-element/string limit.
+/referencePut { % index [r i errorR errorI gapLM gapLE gapHM gapHE] -> -
+  /record exch def /recordIndex exch def
+  /recordBlock recordIndex 512 idiv def
+  referenceTable recordBlock known not {
+    referenceTable recordBlock 4096 array put
+  } if
+  referenceTable recordBlock get recordIndex 512 mod 8 mul record putinterval
+} bind def
+/referenceGet { % index -> block offset
+  dup 512 idiv referenceTable exch get exch 512 mod 8 mul
+} bind def
+/referenceRecord {
+  /rv zrL bigNative def /iv ziL bigNative def
+  zrH zrL tempA bigSubtract /re tempA bigNative abs rv abs unitRoundoff 8 mul mul add inflate def
+  ziH ziL tempA bigSubtract /ie tempA bigNative abs iv abs unitRoundoff 8 mul mul add inflate def
+  zrL zrH bigCompare 0 eq {
+    rv 0 tempA fromDyadic zrL tempA bigCompare 0 eq { /re 0.0 def } if
+  } if
+  ziL ziH bigCompare 0 eq {
+    iv 0 tempA fromDyadic ziL tempA bigCompare 0 eq { /ie 0.0 def } if
+  } if
+  magL four gapL bigSubtract magH four gapH bigSubtract
+  /gLE 0 def /gHE 0 def /gLM 0 def /gHM 0 def
+  gapL bigExtended /gLE exch def /gLM exch def
+  gapH bigExtended /gHE exch def /gHM exch def
+  % Relative conversion bounds, with outward direction for signed endpoints.
+  /gLM gLM gLM abs unitRoundoff 8 mul mul sub def
+  /gHM gHM gHM abs unitRoundoff 8 mul mul add def
+  orbitIteration [rv iv re ie gLM gLE gHM gHE] referencePut
+} bind def
+/prepareReference {
+  /referenceTable 64 dict def
+  /referencePeriod 0 def /referenceCycleStart 0 def
+  resetOrbit
+  /magL newBig def /magH newBig def referenceRecord
+  /referenceGood true def
+  {
+    orbitIteration iterations ge { exit } if
+    fixedOrbitStep
+    orbitIteration 1 eq centreOnCircle and { four magL bigCopy four magH bigCopy } if
+    magL four bigCompare 0 gt { referenceRecord exit } if
+    magH four bigCompare 0 gt { /referenceGood false def exit } if
+    % Keep the reference enclosure much narrower than native coefficient error.
+    zrH zrL tempA bigSubtract ziH ziL tempB bigSubtract
+    tempA bigNative abs tempB bigNative abs max 1e-12 gt {
+      /referenceGood false def exit
+    } if
+    referenceRecord
+    fixedCycle {
+      /referencePeriod orbitIteration checkpointIteration sub def
+      /referenceCycleStart checkpointIteration def exit
+    } if
+  } loop
+  /referenceCount orbitIteration def
+} bind def
+
+% Conservative analytic interior tests. On |centre|<=2 and the tested box,
+% coordinate error is bounded by 256u, derivative contributions by 8704u,
+% and arithmetic by 256u. The strict margin is 16384u. Ambiguous points
+% receive the full orbit. These certificates refer to the whole input interval.
+/InteriorWork 12 dict def
+/knownInterior { % cr ci -> bool
+  InteriorWork begin /b exch def /a exch def /inside false def
+  useInterior centreR abs 2 le and centreI abs 2 le and
+  a -1.25 ge and a 0.375 le and b abs 0.65 le and {
+    /margin unitRoundoff 16384 mul def
+    /yy b b mul def /v a 0.25 sub def /q v v mul yy add def
+    q q v add mul yy 0.25 mul margin sub lt
+    a 1 add dup mul yy add 0.0625 margin sub lt or
+    { /inside true def } if
+  } if inside end
+} bind def
+
+/NativeWork 36 dict def
+/nativePoint { % cr ci coordinate-error -> iteration magnitudeLo magnitudeHi certain
+  NativeWork begin /ce exch def /ci exch def /cr exch def
+  /r 0.0 def /i 0.0 def /rr 0.0 def /ii 0.0 def /error 0.0 def
+  /n 0 def /lo 0.0 def /hi 0.0 def /certain true def /escaped false def
+  {
+    n iterations ge { exit } if
+    /norm rr ii add sqrt inflate def
+    /error norm 2 mul error add error mul ce add
+      rr ii add cr abs add ci abs add roundReserve mul add inflate def
+    /i r r add i mul ci add def /r rr ii sub cr add def
+    /rr r r mul def /ii i i mul def /n n 1 add def
+    /mag rr ii add def
+    /me rr ii add sqrt inflate 2 mul error mul error dup mul add
+      mag roundReserve mul add inflate def
+    /lo mag me sub def /hi mag me add def
+    lo 4 gt { /escaped true def exit } if
+    hi 4 gt { /certain false def exit } if
+  } loop
+  escaped not { /n 0 def } if n lo hi certain end
+} bind def
+
+% Compensated pairs provide about twice the native significand precision.
+% Dekker products and compensated sums use ordinary round-to-nearest binary
+% operations. Their forward bound pays 64u^2 per complex operation group;
+% unresolved pairs still use the arbitrary-precision interval fallback.
+/DDNormalWork 5 dict def
+/ddNormalize {
+  DDNormalWork begin /l exch def /h exch def /s h l add def
+  s l s h sub sub end
+} bind def
+/DDArithmeticWork 24 dict def
+/ddAdd { % ah al bh bl -> hi lo
+  DDArithmeticWork begin /bl exch def /bh exch def /al exch def /ah exch def
+  /s ah bh add def /v s ah sub def
+  s ah s v sub sub bh v sub add al add bl add ddNormalize end
+} bind def
+/ddMultiply { % ah al bh bl -> hi lo
+  DDArithmeticWork begin /bl exch def /bh exch def /al exch def /ah exch def
+  /p ah bh mul def /ac splitter ah mul def /bc splitter bh mul def
+  /aHigh ac ac ah sub sub def /aLow ah aHigh sub def
+  /bHigh bc bc bh sub sub def /bLow bh bHigh sub def
+  /residual aHigh bHigh mul p sub aHigh bLow mul add aLow bHigh mul add
+    aLow bLow mul add def
+  p residual ah bl mul add al bh mul add al bl mul add ddNormalize end
+} bind def
+/DDPointWork 60 dict def
+/ddPoint { % column row -> iteration magnitudeLo magnitudeHi certain
+  DDPointWork begin /row exch def /col exch def
+  Mandelbrot /doubleDoubleCount doubleDoubleCount 1 add put
+  col 0.5 add rasterWidth 2 div sub 0.0 spacingReal 0.0 ddMultiply
+  centreRH centreRL ddAdd /crLw exch def /crHw exch def
+  rasterHeight 2 div row sub 0.5 sub 0.0 spacingReal 0.0 ddMultiply
+  centreIH centreIL ddAdd /ciLw exch def /ciHw exch def
+  /ce centreDDError centreRH abs centreIH abs add
+    crHw abs add ciHw abs add ddReserve mul add inflate def
+  /rh 0.0 def /rl 0.0 def /ih 0.0 def /il 0.0 def
+  /rrh 0.0 def /rrl 0.0 def /iih 0.0 def /iil 0.0 def
+  /error 0.0 def /norm 0.0 def /n 0 def
+  /certain true def /escaped false def /lo 0.0 def /hi 0.0 def
+  {
+    n iterations ge { exit } if
+    /error norm 2 mul error add error mul ce add
+      rrh abs iih abs add crHw abs add ciHw abs add ddReserve mul add inflate def
+    rh rl ih il ddMultiply /tl exch 2 mul def /th exch 2 mul def
+    th tl ciHw ciLw ddAdd /nextIL exch def /nextIH exch def
+    rrh rrl iih neg iil neg ddAdd crHw crLw ddAdd /rl exch def /rh exch def
+    /ih nextIH def /il nextIL def
+    rh rl rh rl ddMultiply /rrl exch def /rrh exch def
+    ih il ih il ddMultiply /iil exch def /iih exch def
+    rrh rrl iih iil ddAdd /ml exch def /mh exch def
+    /norm rh ih normUpper rl abs add il abs add inflate def
+    /me norm 2 mul error mul error dup mul add mh abs ddReserve mul add inflate def
+    mh ml -4.0 0.0 ddAdd add /gap exch def
+    /n n 1 add def
+    gap me gt { /escaped true def
+      /magnitude mh ml add def /colourError me magnitude abs unitRoundoff 8 mul mul add inflate def
+      /lo magnitude colourError sub 4 max def /hi magnitude colourError add def exit
+    } if
+    gap neg me lt { /certain false def exit } if
+  } loop
+  escaped not { /n 0 def } if n lo hi certain end
+} bind def
+
+% Perturbations use a separate binary exponent, including beyond real underflow.
+% Their forward error encloses coefficient conversion, coordinate products,
+% discarded tiny terms, and every native arithmetic operation. An ambiguous
+% escape test or colour interval requests direct fixed-point recomputation.
+/PerturbWork 80 dict def
+/scaledGap { % mantissa exponent deltaExponent lower? -> signed bound/sentinel
+  /sgLower exch def sub /sgE exch def /sgM exch def
+  sgM 0 eq {0.0} { sgE 60 gt { sgM 0 lt {-1e18} {1e18} ifelse }
+  { sgE -100 lt {
+      sgLower { sgM 0 lt {-1e-26} {0.0} ifelse }
+        { sgM 0 gt {1e-26} {0.0} ifelse } ifelse
+    } { sgM 2 sgE exp mul } ifelse } ifelse } ifelse
+} bind def
+/perturbPoint { % normalized dcR dcI -> iteration magnitudeLo magnitudeHi certain
+  PerturbWork begin /dcI exch def /dcR exch def
+  /exponent stepExponent def /r 0.0 def /i 0.0 def /error 0.0 def
+  /dcError dcR abs dcI abs add unitRoundoff 8 mul mul inflate def
+  /originalDCNorm dcR abs dcI abs add def
+  /n 0 def /refIndex 0 def /escaped false def /certain true def /lo 0.0 def /hi 0.0 def
+  % For the exact endpoint c0=-2, z1=-2 and zn=2 for n>=2. A bounded
+  % first-order prefix avoids hundreds of tiny perturbation steps. The proof
+  % (including every skipped bailout) is given in docs/numerics.md.
+  cuspSeedN 2 ge dcR dcError sub 0 gt and {
+    /q originalDCNorm dcError 2 mul add def
+    q dup mul cuspSeedScale mul 16 mul dcR dcError sub lt {
+      /exponent cuspSeedExponent def /n cuspSeedN def /refIndex 2 def
+      /smallTerm cuspSeedN 50 gt {0.0} {2 cuspSeedN -2 mul exp 3 div} ifelse def
+      /r dcR 6 div neg dcR smallTerm mul sub def
+      /i dcI 6 div neg dcI smallTerm mul sub def
+      /error q dup mul cuspSeedScale mul
+        r abs i abs add roundReserve mul add q 1e-26 mul add inflate def
+    } if
+  } if
+  {
+    n iterations ge { exit } if
+    refIndex referenceGet /off exch def /block exch def
+    /zr block off get def /zi block off 1 add get def
+    /ze block off 2 add get block off 3 add get add inflate def
+    /deltaScale exponent -100 lt {0.0} {2 exponent exp} ifelse def
+    /dcScale stepExponent exponent sub dup -100 lt {pop 0.0} {2 exch exp} ifelse def
+    /dr dcR dcScale mul def /di dcI dcScale mul def
+    /dn r i normUpper def /zn zr zi normUpper def
+    /operation zn 2 mul dn mul deltaScale dn dup mul mul add dr abs add di abs add def
+    /nextError zn 2 mul deltaScale dn 2 mul mul add error mul
+      deltaScale error dup mul mul add
+      ze 2 mul dn error add mul add
+      dcError dcScale mul add
+      operation roundReserve mul add inflate def
+    deltaScale 0 eq { /nextError nextError dn dup mul 1e-26 mul add inflate def } if
+    dcScale 0 eq { /nextError nextError originalDCNorm 1e-26 mul add inflate def } if
+    /nr zr r mul zi i mul sub 2 mul
+      r r mul i i mul sub deltaScale mul add dr add def
+    /ni zr i mul zi r mul add 2 mul r i mul 2 mul deltaScale mul add di add def
+    /r nr def /i ni def /error nextError def
+    /n n 1 add def /refIndex refIndex 1 add def
+    r abs i abs max 16 gt {
+      /r r 65536 div def /i i 65536 div def /error error 65536 div def
+      /exponent exponent 16 add def
+    } if
+    exponent 100 gt { /certain false def exit } if
+    refIndex referenceGet /off exch def /block exch def
+    /zr block off get def /zi block off 1 add get def
+    /ze block off 2 add get block off 3 add get add inflate def
+    /deltaScale exponent -100 lt {0.0} {2 exponent exp} ifelse def
+    /dn r i normUpper def /zn zr zi normUpper def
+    /correction zr r mul zi i mul add 2 mul r r mul i i mul add deltaScale mul add def
+    /me zn 2 mul deltaScale dn 2 mul mul add error mul
+      deltaScale error dup mul mul add
+      ze 2 mul dn error add mul add
+      zn 2 mul dn mul deltaScale dn dup mul mul add roundReserve mul add inflate def
+    deltaScale 0 eq { /me me dn dup mul 1e-26 mul add inflate def } if
+    /gl block off 4 add get block off 5 add get exponent true scaledGap correction add me sub def
+    /gh block off 6 add get block off 7 add get exponent false scaledGap correction add me add def
+    gl 0 gt {
+      % Reconstruct magnitude separately. A saturated scaled-gap sentinel
+      % proves a sign, but must never be used as an approximate magnitude.
+      /mr zr r deltaScale mul add def /mi zi i deltaScale mul add def
+      /actualNorm mr mi normUpper def /magnitude mr mr mul mi mi mul add def
+      /actualError ze error deltaScale mul add
+        zn dn deltaScale mul add roundReserve mul add inflate def
+      deltaScale 0 eq { /actualError actualError dn 1e-26 mul add inflate def } if
+      /magnitudeError actualNorm 2 mul actualError mul actualError dup mul add
+        magnitude roundReserve mul add inflate def
+      /lo magnitude magnitudeError sub 4 max def /hi magnitude magnitudeError add def
+      /escaped true def exit
+    } if
+    gh 0 gt { /certain false def exit } if
+    % Rebase against reference z0 when its escaped endpoint is reached. Only
+    % native-range values can reach an escaped reference from a bounded pixel.
+    refIndex referenceCount ge {
+      referencePeriod 0 gt { /refIndex referenceCycleStart def } {
+        exponent -100 lt { /certain false def exit } if
+        /r zr r deltaScale mul add def /i zi i deltaScale mul add def
+        /error error deltaScale mul ze add r abs i abs add roundReserve mul add inflate def
+        /exponent 0 def /refIndex 0 def
+      } ifelse
+    } if
+  } loop
+  escaped not { /n 0 def } if n lo hi certain end
+} bind def
+
+% Exact fallback: outward fixed-point intervals, with precision increased until
+% the complete finite orbit has a certified escape or certified nonescape.
+% A save/restore scope releases each attempt and preserves the shared reference.
+/fixedPixel { % column row -> iteration magnitudeLo magnitudeHi
+  /fallbackRow exch def /fallbackColumn exch def
+  Mandelbrot /fallbackCount fallbackCount 1 add put /fallbackBits precisionBits def
+  {
+    /attempt save def fallbackBits initializeFixed
+    fallbackColumn 2 mul 1 add rasterWidth sub tempA bigSmall
+    fixedStep tempA tempB bigMultiply tempB 2 divideSmall pop
+    tempB crL crL bigAdd tempB crH crH bigAdd
+    rasterHeight fallbackRow 2 mul sub 1 sub tempA bigSmall
+    fixedStep tempA tempB bigMultiply tempB 2 divideSmall pop
+    tempB ciL ciL bigAdd tempB ciH ciH bigAdd
+    useInterior ciL 0 get 0 eq and ciH 0 get 0 eq and {
+      -2 tempA bigSmall 0.25 0 tempB fromDyadic
+      crL tempA bigCompare 0 ge crH tempB bigCompare 0 le and {
+        0 0.0 0.0 attempt restore exit
+      } if
+    } if
+    resetOrbit /resolved true def /escaped false def
+    {
+      orbitIteration iterations ge { exit } if fixedOrbitStep
+      orbitIteration 1 eq magL four bigCompare 0 le and magH four bigCompare 0 gt and {
+        fallbackColumn fallbackRow false exactCircle {
+          four magL bigCopy four magH bigCopy
+        } if
+      } if
+      magL four bigCompare 0 gt { /escaped true def exit } if
+      magH four bigCompare 0 gt { /resolved false def exit } if
+      fixedCycle { exit } if
+    } loop
+    resolved {
+      escaped {
+        /ml magL bigNative def /mh magH bigNative def
+        /ml ml ml abs unitRoundoff 8 mul mul sub 4 max def
+        /mh mh mh abs unitRoundoff 8 mul mul add def
+        orbitIteration ml phaseIndex orbitIteration mh phaseIndex colourCompatible not {
+          /resolved false def
+        } if
+      } { /ml 0.0 def /mh 0.0 def } ifelse
+    } if
+    resolved {
+      escaped {orbitIteration} {0} ifelse ml mh attempt restore exit
+    } if
+    fallbackBits 128 add attempt restore /fallbackBits exch def
+    fallbackBits reportedPixelBits gt {
+      Mandelbrot /reportedPixelBits fallbackBits put
+      verbose { (Increasing pixel precision to ) print fallbackBits = flush } if
+    } if
+  } loop
+} bind def
+
+% A difficult endpoint pixel can restart at the same proved prefix with wider
+% fixed-point intervals. This retains the original subnormal coordinate in an
+% explicit enclosure without paying for a thousand-bit multiply on every step.
+/SeedWork 12 dict def
+/seedComponent { % twice-offset lower upper -> -
+  SeedWork begin /oh exch def /ol exch def /factor exch def
+  factor tempA bigSmall fixedStep tempA tempB bigMultiply
+  tempB 2 divideSmall pop tempB bigNegate
+  /sg tempB 0 get def /lost tempB 6 divideSmall 0 ne def
+  tempB bigNormalize tempB ol bigCopy tempB oh bigCopy
+  lost { sg 0 lt { ol bigIncrement ol 0 -1 put }
+    { oh bigIncrement oh 0 1 put } ifelse } if
+  ol prefixError ol bigSubtract oh prefixError oh bigAdd end
+} bind def
+/cuspPixel { % column row -> iteration magnitudeLo magnitudeHi
+  /cuspRow exch def /cuspColumn exch def /cuspBits 192 def
+  Mandelbrot /fallbackCount fallbackCount 1 add put
+  {
+    cuspBits 64 add stepExponent neg ge {
+      cuspColumn cuspRow fixedPixel exit
+    } if
+    /cuspAttempt save def
+    /seedN stepExponent neg radius log2 sub cuspBits 2 div sub 2 div floor cvi
+      iterations min def
+    /originalExponent stepExponent def
+    /stepExponent stepExponent seedN 2 mul add def
+    cuspBits initializeFixed resetOrbit
+    /prefixError newBig def /ulp newBig def ulp 0 1 put ulp 1 1 put
+    % radius encloses the sum norm of every exact normalized pixel offset.
+    radius inflate stepExponent tempA fromDyadic tempA tempA prefixError multiplyUp
+    prefixError bigIncrement prefixError 0 1 put
+    cuspColumn 2 mul 1 add rasterWidth sub zrL zrH seedComponent
+    rasterHeight cuspRow 2 mul sub 1 sub ziL ziH seedComponent
+    2 tempA bigSmall zrL tempA zrL bigAdd zrH tempA zrH bigAdd
+    % The omitted dc/3 and the original dc are each strictly below one ulp.
+    -2 crL bigSmall -2 crH bigSmall crL ulp crL bigSubtract crH ulp crH bigAdd
+    ulp ciH bigCopy ulp ciL bigCopy ciL bigNegate
+    zrL zrH rrL rrH intervalSquare ziL ziH iiL iiH intervalSquare
+    /orbitIteration seedN def /resolved true def /escaped false def
+    {
+      orbitIteration iterations ge { exit } if fixedOrbitStep
+      magL four bigCompare 0 gt { /escaped true def exit } if
+      magH four bigCompare 0 gt { /resolved false def exit } if
+      fixedCycle { exit } if
+    } loop
+    resolved {
+      escaped {
+        /ml magL bigNative def /mh magH bigNative def
+        /ml ml ml abs unitRoundoff 8 mul mul sub 4 max def
+        /mh mh mh abs unitRoundoff 8 mul mul add def
+        orbitIteration ml phaseIndex orbitIteration mh phaseIndex colourCompatible not
+          { /resolved false def } if
+      } { /ml 0.0 def /mh 0.0 def } ifelse
+    } if
+    resolved {
+      escaped {orbitIteration} {0} ifelse ml mh cuspAttempt restore exit
+    } if
+    cuspBits 128 add cuspAttempt restore /cuspBits exch def
+  } loop
+} bind def
+
+/PixelWork 30 dict def
+/pixel { % column row -> RGB palette offset, or -1 for black
+  PixelWork begin /row exch def /col exch def
+  useCoordinateCache {
+    /dx col getColumnOffset def /dy row getRowOffset def
+  } {
+    /dx col 0.5 add rasterWidth 2 div sub stepMantissa mul def
+    /dy rasterHeight 2 div row sub 0.5 sub stepMantissa mul def
+  } ifelse
+  /cr centreR dx nativeStep mul add def /ci centreI dy nativeStep mul add def
+  /coordinateError centreError dx abs dy abs add nativeStep mul
+    cr abs ci abs add add unitRoundoff 8 mul mul add inflate def
+  /axisInterior false def
+  useInterior centreImaginaryZero and dy 0 eq and {
+    cr coordinateError sub -2 ge cr coordinateError add 0.25 le and
+      { /axisInterior true def } if
+    atCusp dx 0 ge and nativeStep 0 eq dx nativeStep mul 2 le or and
+      { /axisInterior true def } if
+  } if
+  /verticalCusp atCusp dx 0 eq and dy 0 ne and stepExponent -100 lt and def
+  cr ci knownInterior axisInterior or { -1 } { verticalCusp {
+    1 4.0 phaseIndex 3 mul
+  } {
+    /certain false def /n 0 def /lo 0.0 def /hi 0.0 def
+    perturbReady {
+      dx dy perturbPoint /certain exch def /hi exch def /lo exch def /n exch def
+    } {
+      useNative nativeStep 0 gt and {
+        cr ci coordinateError
+        nativePoint /certain exch def /hi exch def /lo exch def /n exch def
+      } if
+    } ifelse
+    certain n 0 gt and {
+      n lo phaseIndex n hi phaseIndex colourCompatible not { /certain false def } if
+    } if
+    certain not useDoubleDouble and stepExponent -90 ge and {
+      col row ddPoint /certain exch def /hi exch def /lo exch def /n exch def
+      certain n 0 gt and {
+        n lo phaseIndex n hi phaseIndex colourCompatible not { /certain false def } if
+      } if
+    } if
+    certain not {
+      atCusp cuspSeedN 2 ge and dx 0 gt and {
+        col row cuspPixel
+      } { col row fixedPixel } ifelse
+      /hi exch def /lo exch def /n exch def
+    } if
+    n 0 eq {-1} {n lo hi add 2 div 4 max phaseIndex 3 mul} ifelse
+  } ifelse } ifelse end
+} bind def
+
+/validDecimal { % string -> bool; URL coordinates deliberately exclude exponents
+  dup type /stringtype ne { pop false } {
+    /validationText exch def /digits 0 def /dots 0 def /valid true def
+    0 1 validationText length 1 sub {
+      /vi exch def /vc validationText vi get def
+      vc 48 ge vc 57 le and { /digits digits 1 add def } {
+        vc 46 eq { /dots dots 1 add def } {
+          vi 0 eq vc 43 eq vc 45 eq or and not { /valid false def } if
+        } ifelse
+      } ifelse
+    } for valid digits 0 gt and dots 1 le and
+  } ifelse
+} bind def
+/validate {
+  /languagelevel where { pop languagelevel 2 lt } { true } ifelse
+    { (PostScript LanguageLevel 2 or later is required.) fail } if
+  x validDecimal y validDecimal and not { (x and y must be plain decimal strings.) fail } if
+  zoom isNumber not { (zoom must be a nonnegative number.) fail } if
+  zoom 0 lt { (zoom must be nonnegative.) fail } if
+  zoom 8388606 gt { (The requested zoom exceeds the portable iteration counter.) fail } if
+  renderDPI isNumber not { (renderDPI must be a nonnegative number.) fail } if
+  renderDPI 0 lt { (renderDPI must be nonnegative; use 0 for device resolution.) fail } if
+  landscape type /booleantype ne { (landscape must be true or false.) fail } if
+  marginMM isNumber not { (marginMM must be a nonnegative number.) fail } if
+  marginMM 0 lt { (marginMM must be nonnegative.) fail } if
+  stripRows type /integertype ne { (stripRows must be an integer.) fail } if
+  stripRows 1 lt stripRows 64 gt or { (stripRows must be between 1 and 64.) fail } if
+  [useInterior useSymmetry usePerturbation useNative useDoubleDouble useCoordinateCache useCycle verbose] {
+    type /booleantype ne { (Rendering switches must be true or false.) fail } if
+  } forall
+  % Preserve enough integer digits for the square of an escaped coordinate.
+  % Fractional text length must not drive quadratic arithmetic unnecessarily.
+  /integerDigits 3 def
+  [x y] {
+    /it exch def /before 0 def
+    it { dup 46 eq { pop exit } if 48 ge { /before before 1 add def } if } forall
+    /integerDigits integerDigits before 7 mul 15 idiv 3 add max def
+  } forall
+} bind def
+/preparePage {
+  /pageWidth landscape {297} {210} ifelse 72 mul 25.4 div def
+  /pageHeight landscape {210} {297} ifelse 72 mul 25.4 div def
+  << /PageSize [pageWidth pageHeight] /ImagingBBox null >> setpagedevice
+  currentpagedevice /PageSize get aload pop
+  pageHeight sub abs 0.1 gt exch pageWidth sub abs 0.1 gt or
+    { (The output device did not accept the requested A4 page size.) fail } if
+  /margin marginMM 72 mul 25.4 div def
+  initgraphics clippath pathbbox /clipTop exch def /clipRight exch def
+    /clipBottom exch def /clipLeft exch def newpath
+  /left margin clipLeft max def /bottom margin clipBottom max def
+  /right pageWidth margin sub clipRight min def /top pageHeight margin sub clipTop min def
+  right left le top bottom le or { (The margins leave no imageable area.) fail } if
+  /dpi renderDPI def
+  dpi 0 eq {
+    /resolution currentpagedevice /HWResolution get def
+    /dpi resolution 0 get resolution 1 get max def
+  } if
+  dpi 0 le { (The device reported an invalid resolution.) fail } if
+  /rasterWidth right left sub dpi mul 72 div 0.5 add floor cvi 1 max def
+  /rasterHeight top bottom sub dpi mul 72 div 0.5 add floor cvi 1 max def
+  /indexLimit 2 nativeBits 1 sub exp 2147483647 min def
+  rasterWidth indexLimit gt rasterHeight indexLimit gt or {
+    (The raster exceeds exact half-pixel indexing at the detected native precision.) fail
+  } if
+  /pitch right left sub rasterWidth div top bottom sub rasterHeight div min def
+  /originX left right left sub rasterWidth pitch mul sub 2 div add def
+  /originY bottom top bottom sub rasterHeight pitch mul sub 2 div add def
+  verbose {
+    (A4 raster: ) print rasterWidth printValue ( x ) print rasterHeight printValue
+    ( at ) print dpi printValue ( dpi; native significand: ) print nativeBits printValue ( bits\n) print
+    left margin 0.1 add gt bottom margin 0.1 add gt or
+    right pageWidth margin sub 0.1 sub lt or top pageHeight margin sub 0.1 sub lt or
+      { (The image respects device clipping and device-pixel rounding.\n) print } if flush
+  } if
+} bind def
+/prepareView {
+  /base 3.0 rasterWidth div 2.5 rasterHeight div max def
+  /wholeZoom zoom floor cvi def
+  /stepMantissa base 2 zoom wholeZoom sub neg exp mul def
+  /stepExponent wholeZoom neg def
+  { stepMantissa 1 ge { exit } if /stepMantissa stepMantissa 2 mul def
+    /stepExponent stepExponent 1 sub def } loop
+  { stepMantissa 2 lt { exit } if /stepMantissa stepMantissa 2 div def
+    /stepExponent stepExponent 1 add def } loop
+  % For 1<=mantissa<2, ceil(-9-log2(s)) is exactly -9-exponent.
+  % This integer identity avoids log/ceil roundoff at every budget threshold.
+  /level 0 -9 stepExponent sub max def
+  level 8388605 gt { (The iteration budget exceeds portable signed integer capacity.) fail } if
+  /iterations 512 level 256 mul add def
+  /precisionBits wholeZoom 128 add 128 max def
+  /fallbackCount 0 def /doubleDoubleCount 0 def
+  /reportedPixelBits precisionBits def /perturbReady false def
+  /cuspSeedN 0 def /cuspSeedExponent 0 def /cuspSeedScale 0.0 def
+  precisionBits initializeFixed
+  /centreR crL bigNative def /centreI ciL bigNative def
+  /centreOnCircle false def
+  centreR dup mul centreI dup mul add 4 sub abs unitRoundoff 1024 mul lt {
+    /centreOnCircle 0 0 true exactCircle def
+  } if
+  /centreImaginaryZero ciL 0 get 0 eq ciH 0 get 0 eq and def
+  /centreError centreR abs centreI abs add unitRoundoff 16 mul mul inflate def
+  /nativeStep stepExponent -100 lt {0.0} {2 stepExponent exp} ifelse def
+  /spacingReal stepMantissa nativeStep mul def
+  /centreRH centreR def /centreIH centreI def
+  centreRH 0 tempA fromDyadic crL tempA tempB bigSubtract /centreRL tempB bigNative def
+  centreIH 0 tempA fromDyadic ciL tempA tempB bigSubtract /centreIL tempB bigNative def
+  crH crL tempA bigSubtract ciH ciL tempB bigSubtract
+  /centreDDError tempA bigNative abs tempB bigNative abs add
+    centreRL abs centreIL abs add unitRoundoff 8 mul mul add inflate def
+  useCoordinateCache {
+    rasterWidth 65535 le {
+      /columnOffsets rasterWidth array def
+      /getColumnOffset { columnOffsets exch get } bind def
+      0 1 rasterWidth 1 sub { /cacheIndex exch def
+        columnOffsets cacheIndex cacheIndex 0.5 add rasterWidth 2 div sub stepMantissa mul put
+      } for
+    } {
+      /columnOffsets 64 dict def
+      /getColumnOffset { dup 1024 idiv columnOffsets exch get exch 1024 mod get } bind def
+      0 1 rasterWidth 1 sub { /cacheIndex exch def /cacheBlock cacheIndex 1024 idiv def
+        columnOffsets cacheBlock known not { columnOffsets cacheBlock 1024 array put } if
+        columnOffsets cacheBlock get cacheIndex 1024 mod
+          cacheIndex 0.5 add rasterWidth 2 div sub stepMantissa mul put
+      } for
+    } ifelse
+    rasterHeight 65535 le {
+      /rowOffsets rasterHeight array def
+      /getRowOffset { rowOffsets exch get } bind def
+      0 1 rasterHeight 1 sub { /cacheIndex exch def
+        rowOffsets cacheIndex rasterHeight 2 div cacheIndex sub 0.5 sub stepMantissa mul put
+      } for
+    } {
+      /rowOffsets 64 dict def
+      /getRowOffset { dup 1024 idiv rowOffsets exch get exch 1024 mod get } bind def
+      0 1 rasterHeight 1 sub { /cacheIndex exch def /cacheBlock cacheIndex 1024 idiv def
+        rowOffsets cacheBlock known not { rowOffsets cacheBlock 1024 array put } if
+        rowOffsets cacheBlock get cacheIndex 1024 mod
+          rasterHeight 2 div cacheIndex sub 0.5 sub stepMantissa mul put
+      } for
+    } ifelse
+  } if
+  /mirrorSum -1 def
+  useSymmetry ciL 0 get 0 eq ciH 0 get 0 eq and and {
+    /mirrorSum rasterHeight 1 sub def
+  } if
+  useSymmetry mirrorSum 0 lt and nativeStep 0 gt and ciL ciH bigCompare 0 eq and {
+    /ratio centreI 2 mul stepMantissa nativeStep mul div def
+    ratio abs rasterHeight lt {
+      /candidate ratio round cvi def candidate tempA bigSmall
+      fixedStep tempA tempB bigMultiply ciL ciL tempA bigAdd
+      tempA tempB bigCompare 0 eq { /mirrorSum rasterHeight 1 sub candidate add def } if
+    } if
+  } if
+  -2 tempA bigSmall crL tempA bigCompare 0 eq crH tempA bigCompare 0 eq and
+  centreImaginaryZero and /atCusp exch def
+  atCusp stepExponent -100 lt and {
+    /radius rasterWidth rasterHeight add 2 div stepMantissa mul def
+    /cuspSeedN stepExponent neg radius log2 sub 60 sub 2 div floor cvi
+      iterations min 0 max def
+    /cuspSeedExponent stepExponent cuspSeedN 2 mul add def
+    /cuspSeedScale 2 cuspSeedExponent exp def
+  } if
+  usePerturbation zoom 4 ge and centreR centreI knownInterior not and {
+    {
+      /referenceAttempt save def precisionBits initializeFixed prepareReference
+      referenceGood { /perturbReady true def exit } if
+      precisionBits 128 add referenceAttempt restore /precisionBits exch def
+      verbose { (Increasing reference precision to ) print precisionBits = flush } if
+    } loop
+  } if
+  verbose {
+    (Iteration budget: ) print iterations printValue (; fixed precision: ) print F 15 mul printValue
+    ( bits; perturbation: ) print perturbReady = flush
+  } if
+} bind def
+/emitStrip { % x y width height data mirrored? -> -
+  /flipped exch def /data exch def /sh exch def /sw exch def /sy exch def /sx exch def
+  gsave originX sx pitch mul add originY rasterHeight sy sub sh sub pitch mul add translate
+  sw pitch mul sh pitch mul scale
+  sw sh 8 flipped { [sw 0 0 sh 0 0] } { [sw 0 0 sh neg 0 sh] } ifelse
+    data false 3 colorimage grestore
+} bind def
+/render {
+  /maxChunk 2048 65535 stripRows 3 mul idiv min def
+  /buffer maxChunk stripRows mul 3 mul string def
+  /row 0 def /lastProgress -1 def
+  {
+    row rasterHeight ge { exit } if
+    /height stripRows rasterHeight row sub min def /mirror false def
+    mirrorSum 0 ge {
+      /mirrorStart 0 mirrorSum rasterHeight sub 1 add max def
+      /mirrorEnd rasterHeight 1 sub mirrorSum min def
+      /middle mirrorSum 2 idiv def
+      row mirrorStart lt { /height height mirrorStart row sub min def } {
+        row mirrorEnd le {
+          row middle gt { /row mirrorEnd 1 add def
+            /height stripRows rasterHeight row sub min def } {
+            /paired mirrorSum 1 add 2 idiv row sub def
+            paired 0 gt { /height height paired min def /mirror true def }
+              { /height 1 def } ifelse
+          } ifelse
+        } if
+      } ifelse
+    } if
+    row rasterHeight ge { exit } if
+    /col 0 def
+    {
+      col rasterWidth ge { exit } if
+      /width maxChunk rasterWidth col sub min def /offset 0 def
+      0 1 height 1 sub { /stripY exch def
+        0 1 width 1 sub { /stripX exch def
+          col stripX add row stripY add pixel /colour exch def
+          colour 0 lt { buffer offset 0 put buffer offset 1 add 0 put buffer offset 2 add 0 put }
+            { buffer offset palette colour 3 getinterval putinterval } ifelse
+          /offset offset 3 add def
+        } for
+      } for
+      /bytes buffer 0 offset getinterval def col row width height bytes false emitStrip
+      mirror { col mirrorSum row sub height sub 1 add width height bytes true emitStrip } if
+      /col col width add def
+    } loop
+    /row row height add def
+    /progress row 100 mul rasterHeight idiv def
+    progress 10 idiv lastProgress gt {
+      /lastProgress progress 10 idiv def verbose { (Computed rows: ) print row = flush } if
+    } if
+  } loop
+} bind def
+
+% -- Execution --
+%%BeginSetup
+validate preparePalette preparePage prepareView
+%%EndSetup
+%%Page: 1 1
+/started usertime def
+render
+showpage
+verbose { (Completed in ) print usertime started sub 1000.0 div printValue
+  ( seconds; precise pixel fallbacks: ) print fallbackCount printValue
+  (; compensated retries: ) print doubleDoubleCount = flush } if
+end
+MandelbrotJobSave restore
+%%Trailer
+%%EOF
